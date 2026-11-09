@@ -1,0 +1,41 @@
+name: Formasyon Alarmi
+
+on:
+  schedule:
+    # Hafta içi, her 5 dakikada bir (dakika 3, 8, 13, ...). UTC 12-21 hem yaz hem kış saatini kapsar.
+    # Script, New York 08:00'den önce ve piyasa günü değilse hemen çıkar.
+    - cron: "3-58/5 12-21 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: formasyon
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Önceki durumu geri yükle
+        uses: actions/cache@v4
+        with:
+          path: |
+            avg_cache.json
+            flag_state.json
+          key: flagstate-${{ github.run_id }}
+          restore-keys: flagstate-
+
+      - name: Formasyon tara
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PRICE_MIN: ${{ vars.PRICE_MIN }}
+          PRICE_MAX: ${{ vars.PRICE_MAX }}
+          MIN_AVG_VOL: ${{ vars.MIN_AVG_VOL }}
+          MIN_DAY_VOL: ${{ vars.MIN_DAY_VOL }}
+          FLAG_GAIN_MIN: ${{ vars.FLAG_GAIN_MIN }}
+        run: python3 flag_live.py
