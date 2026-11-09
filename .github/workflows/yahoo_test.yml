@@ -1,0 +1,24 @@
+name: Yahoo Denemesi
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Hisseler (virgülle ayır)"
+        default: "OMH,ELPW,AAPL"
+
+jobs:
+  yahoo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Yahoo seans öncesi veri denemesi
+        env:
+          ALPACA_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_SECRET: ${{ secrets.ALPACA_SECRET }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          YF_SYMBOLS: ${{ inputs.symbols }}
+        run: python3 yahoo_test.py
