@@ -55,7 +55,7 @@ def yahoo_bars(sym):
             c = cols["close"][i]
             if c is None:
                 continue
-            bars.append((t, cols["open"][i], cols["high"][i], cols["low"][i], c, cols["volume"][i] or 0))
+            bars.append((t, cols["open"][i], cols["high"][i], cols["low"][i], c, cols["volume"][i]))  # hacim None olabilir
         return bars, None
     return [], err or "bilinmeyen hata"
 
@@ -82,7 +82,7 @@ def describe(label, bars, day_open_ts):
         return f" {label}: veri yok", None
     pre = [b for b in bars if b[0] < day_open_ts]
     early = [b for b in bars if b[0] < day_open_ts - 90 * 60]          # 08:00'den önce
-    pre_vol = sum(b[5] for b in pre)
+    pre_vol = sum(b[5] or 0 for b in pre)
     first, last = et(bars[0][0]), et(bars[-1][0])
     line = (f" {label}: {len(bars)} mum, ilk {first:%H:%M} son {last:%H:%M} NY | "
             f"seans öncesi {len(pre)} mum, hacim {int(pre_vol):,} | 08:00'den önce {len(early)} mum")
@@ -105,6 +105,13 @@ def main():
         out.append(f"{sym} ({day.isoformat()})")
         yline, ym = describe("Yahoo", ybars, open_ts)
         out.append(yline)
+        # teşhis: hacim alanı gerçekten boş mu, sıfır mı, dolu mu? Son mumlar neye benziyor?
+        nnone = sum(1 for b in ybars if b[5] is None)
+        nzero = sum(1 for b in ybars if b[5] == 0)
+        npos = sum(1 for b in ybars if b[5] and b[5] > 0)
+        out.append(f" Yahoo hacim alanı: boş {nnone}, sıfır {nzero}, pozitif {npos} mum")
+        for b in ybars[-3:]:
+            out.append(f"   {et(b[0]):%H:%M} NY  A {b[1]:.2f}  Y {b[2]:.2f}  D {b[3]:.2f}  K {b[4]:.2f}  hacim {b[5]}")
         try:
             aline, am = describe("Alpaca IEX", alpaca_bars(sym, day), open_ts)
         except Exception as e:
