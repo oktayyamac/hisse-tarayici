@@ -47,6 +47,8 @@ PRICE_MAX = env_float("PRICE_MAX", 30)       # en yüksek fiyat ($)
 MIN_AVG_VOL = env_float("MIN_AVG_VOL", 2000) # 20 günlük ort. günlük hacim alt sınırı (IEX adedi)
 MIN_DAY_VOL = env_float("MIN_DAY_VOL", 5000) # bugünkü hacim alt sınırı (IEX adedi)
 PRE_VOL_FRAC = env_float("PRE_VOL_FRAC", 0.1) # seans öncesi: IEX hacmi, ortalama günlük hacmin en az bu oranı olsun
+MAX_DAY_VOL = env_float("MAX_DAY_VOL", 10000) # normal seans/seans sonrası: bugünkü IEX hacmi bundan DÜŞÜK olsun (0 = sınır yok)
+PRE_MAX_VOL = env_float("PRE_MAX_VOL", 0)     # seans öncesi: IEX hacmi bundan düşük olsun (0 = sınır yok)
 PRE_MIN_VOL = env_float("PRE_MIN_VOL", 1000)  # seans öncesi: en az bu kadar IEX hacmi (seans öncesi işlemler seyrek olduğundan düşük)
 MAX_ALERTS_PER_SCAN = 10
 
@@ -239,6 +241,7 @@ def scan_once(symbols, avg, frac, today_str, require_today=True):
         if c["rvol"] >= RVOL_MIN
         and c["change"] >= CHANGE_MIN
         and PRICE_MIN <= c["price"] <= PRICE_MAX
+        and (not MAX_DAY_VOL or c["vol"] < MAX_DAY_VOL)
     ]
     alerts.sort(key=lambda c: c["rvol"], reverse=True)
     candidates.sort(key=lambda c: c["rvol"], reverse=True)
@@ -247,7 +250,7 @@ def scan_once(symbols, avg, frac, today_str, require_today=True):
 
 def format_alert(c):
     return (
-        f"🚀 {c['sym']}  ${c['price']:.2f}  ({c['change']:+.1f}%)\n"
+        f"🚀 {c['sym']}  ${c['price']:.2f}  ({c['change']:+.1f}%)" + ("  [seans sonrası]" if c.get("post") else "") + "\n"
         f"Göreceli hacim: {c['rvol']:.1f}x\n"
         f"Bugünkü hacim (IEX): {int(c['vol']):,}\n"
         f"https://finviz.com/quote.ashx?t={c['sym']}"
@@ -307,7 +310,7 @@ def scan_premarket(avg, today_str):
     alerts = []
     for change, sym, price in cands:
         vol = vols.get(sym, 0)
-        if vol >= PRE_MIN_VOL and vol >= PRE_VOL_FRAC * avg[sym]:
+        if vol >= PRE_MIN_VOL and vol >= PRE_VOL_FRAC * avg[sym] and (not PRE_MAX_VOL or vol < PRE_MAX_VOL):
             alerts.append({"sym": sym, "price": price, "change": change, "vol": vol,
                            "pct_avg": vol / avg[sym] * 100, "pre": True})
     alerts.sort(key=lambda c: c["pct_avg"], reverse=True)
@@ -358,10 +361,13 @@ def run_once():
     check_settings()
     clock = get_clock()
     now = parse_ts(clock["timestamp"])
+    premarket = post = False
     if clock.get("is_open"):
-        premarket = False
+        pass
     elif parse_ts(clock["next_open"]).date() == now.date() and now.hour >= 8:
         premarket = True      # piyasa bugün açılacak ve New York 08:00 geçti (IEX verisi 08:00'de başlar)
+    elif 16 <= now.hour < 17:
+        post = True           # seans sonrası: IEX 17:00 NY'ye kadar işlem gösterir
     else:
         log("Piyasa kapalı, çıkılıyor.")
         return
@@ -373,7 +379,10 @@ def run_once():
     if premarket:
         alerts = scan_premarket(avg, today_str)
     else:
-        alerts, _ = scan_once(list(avg), avg, session_fraction(clock), today_str)
+        alerts, _ = scan_once(list(avg), avg, 1.0 if post else session_fraction(clock), today_str)
+        if post:
+            for c in alerts:
+                c["post"] = True
     new = [c for c in alerts if c["sym"] not in alerted][:MAX_ALERTS_PER_SCAN]
     for c in new:
         send_telegram(format_alert_pre(c) if c.get("pre") else format_alert(c))
