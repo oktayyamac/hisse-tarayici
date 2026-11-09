@@ -20,6 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -45,6 +46,8 @@ PRICE_MIN = env_float("PRICE_MIN", 1)        # en düşük fiyat ($)
 PRICE_MAX = env_float("PRICE_MAX", 30)       # en yüksek fiyat ($)
 MIN_AVG_VOL = env_float("MIN_AVG_VOL", 2000) # 20 günlük ort. günlük hacim alt sınırı (IEX adedi)
 MIN_DAY_VOL = env_float("MIN_DAY_VOL", 5000) # bugünkü hacim alt sınırı (IEX adedi)
+PRE_VOL_FRAC = env_float("PRE_VOL_FRAC", 0.1) # seans öncesi: IEX hacmi, ortalama günlük hacmin en az bu oranı olsun
+PRE_MIN_VOL = env_float("PRE_MIN_VOL", 1000)  # seans öncesi: en az bu kadar IEX hacmi (seans öncesi işlemler seyrek olduğundan düşük)
 MAX_ALERTS_PER_SCAN = 10
 
 TRADE_URL = "https://paper-api.alpaca.markets"
@@ -251,6 +254,74 @@ def format_alert(c):
     )
 
 
+# ---------------------------------------------------------------- seans öncesi tarama
+def fetch_pre_volumes(syms, today_str):
+    """Bugün New York 04:00'dan şimdiye kadar olan IEX hacmi: {sembol: hacim}."""
+    y, m, d = map(int, today_str.split("-"))
+    start = (datetime(y, m, d, 4, 0, tzinfo=ZoneInfo("America/New_York"))
+             .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    vols = {}
+    for i in range(0, len(syms), 100):
+        token = None
+        while True:
+            params = {"symbols": ",".join(syms[i:i + 100]), "timeframe": "5Min", "start": start,
+                      "limit": 10000, "feed": "iex", "adjustment": "raw"}
+            if token:
+                params["page_token"] = token
+            data = http_json(DATA_URL + "/v2/stocks/bars?" + urllib.parse.urlencode(params), alpaca_headers())
+            for sym, bars in (data.get("bars") or {}).items():
+                vols[sym] = vols.get(sym, 0) + sum(b["v"] for b in bars)
+            token = data.get("next_page_token")
+            time.sleep(0.3)
+            if not token:
+                break
+    return vols
+
+
+def scan_premarket(avg, today_str):
+    """Seans öncesi: fiyat önceki kapanışa göre yükselmiş ve seans öncesi hacim ortalama günlük hacme göre yüksek mi."""
+    pool = [s for s in avg if avg[s] >= MIN_AVG_VOL]
+    cands = []
+    for i in range(0, len(pool), 500):
+        chunk = pool[i:i + 500]
+        url = DATA_URL + "/v2/stocks/snapshots?" + urllib.parse.urlencode({"symbols": ",".join(chunk), "feed": "iex"})
+        data = http_json(url, alpaca_headers())
+        snaps = data.get("snapshots", data)
+        for sym, snap in snaps.items():
+            price = (snap.get("latestTrade") or {}).get("p")
+            db, pb = snap.get("dailyBar"), snap.get("prevDailyBar")
+            if not price:
+                continue
+            if db and db["t"][:10] == today_str:      # bugünün günlük mumu varsa önceki kapanış prevDailyBar'dır
+                prev = (pb or {}).get("c")
+            else:                                       # yoksa son günlük mum dünün kapanışıdır
+                prev = (db or {}).get("c")
+            if not prev:
+                continue
+            change = (price / prev - 1) * 100
+            if change >= CHANGE_MIN and PRICE_MIN <= price <= PRICE_MAX:
+                cands.append((change, sym, price))
+    cands.sort(reverse=True)
+    cands = cands[:200]
+    vols = fetch_pre_volumes([s for _, s, _ in cands], today_str) if cands else {}
+    alerts = []
+    for change, sym, price in cands:
+        vol = vols.get(sym, 0)
+        if vol >= PRE_MIN_VOL and vol >= PRE_VOL_FRAC * avg[sym]:
+            alerts.append({"sym": sym, "price": price, "change": change, "vol": vol,
+                           "pct_avg": vol / avg[sym] * 100, "pre": True})
+    alerts.sort(key=lambda c: c["pct_avg"], reverse=True)
+    return alerts
+
+
+def format_alert_pre(c):
+    return (
+        f"🌅 {c['sym']}  ${c['price']:.2f}  ({c['change']:+.1f}%)  [seans öncesi]\n"
+        f"Seans öncesi hacim (IEX): {int(c['vol']):,}, normal günlük hacmin %{c['pct_avg']:.0f}'i\n"
+        f"https://finviz.com/quote.ashx?t={c['sym']}"
+    )
+
+
 # ---------------------------------------------------------------- ana akış
 def need(name, value):
     if not value:
@@ -286,7 +357,12 @@ def run_test():
 def run_once():
     check_settings()
     clock = get_clock()
-    if not clock.get("is_open"):
+    now = parse_ts(clock["timestamp"])
+    if clock.get("is_open"):
+        premarket = False
+    elif parse_ts(clock["next_open"]).date() == now.date() and now.hour >= 8:
+        premarket = True      # piyasa bugün açılacak ve New York 08:00 geçti (IEX verisi 08:00'de başlar)
+    else:
         log("Piyasa kapalı, çıkılıyor.")
         return
 
@@ -294,13 +370,15 @@ def run_once():
     avg = get_avg_volumes(today_str)
     alerted = load_alerted(today_str)
 
-    frac = session_fraction(clock)
-    alerts, _ = scan_once(list(avg), avg, frac, today_str)
+    if premarket:
+        alerts = scan_premarket(avg, today_str)
+    else:
+        alerts, _ = scan_once(list(avg), avg, session_fraction(clock), today_str)
     new = [c for c in alerts if c["sym"] not in alerted][:MAX_ALERTS_PER_SCAN]
     for c in new:
-        send_telegram(format_alert(c))
+        send_telegram(format_alert_pre(c) if c.get("pre") else format_alert(c))
         alerted.add(c["sym"])
-        log(f"ALARM: {c['sym']} {c['change']:+.1f}% {c['rvol']:.1f}x")
+        log(f"ALARM{' (seans öncesi)' if c.get('pre') else ''}: {c['sym']} {c['change']:+.1f}%")
     if not new:
         log("Yeni alarm yok.")
     save_alerted(today_str, alerted)
