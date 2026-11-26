@@ -1,405 +1,602 @@
 #!/usr/bin/env python3
 """
-Parabolic mover tarayıcı (GitHub Actions sürümü)
-ABD hisselerinde olağandışı hacim artışını bulur ve Telegram'a bildirim gönderir.
+Düşen Trend Kırılım Tarayıcısı (ABD hisseleri) -> Telegram
 
-Her çalıştırmada TEK bir tarama yapar ve çıkar. Zamanlamayı GitHub Actions yapar.
-Sadece Python 3.8+ standart kütüphanesini kullanır, ek paket gerekmez.
-Veri kaynağı: Alpaca ücretsiz hesap (IEX feed).
+Ne yapar?
+  1. ABD hisse evrenini (Nasdaq Trader listesi) çeker, ETF / warrant / test sembollerini eler.
+  2. Günlük (veya saatlik) mumları yfinance ile indirir.
+  3. Her hissede düşen direnç çizgisini (alçalan tepeleri birleştiren trend çizgisi) bulur
+     ve SON KAPANMIŞ mumun bu çizgiyi yukarı kırıp kırmadığına bakar.
+  4. Kırılım varsa giriş / SL / TP1-TP2-TP3 hesaplar ve Telegram'a gönderir.
+
+Kırılım sayılma şartları (hepsi ayarlanabilir, bkz. load_cfg ve PRESETS):
+  - Çizgi en az 3 tepeye dokunur (MIN_TOUCHES), arada tepeler çizginin üstüne çıkmamış olmalı
+  - Çizginin iki tepesi arası düşüş en az MIN_DROP_PCT ve en az 2 ATR (gürültüden büyük)
+  - Önceki mum çizginin üstünde değil -> kırılım "taze" (ilk kırılım mumu)
+  - Kırılım mumu çizginin üstünde kapanır, mum aralığının üst %30'unda kapanır
+  - Kırılım mumu "genişleme mumu" olmalı: boyu en az 1 ATR (MIN_RANGE_ATR)
+  - Hacim, son 20 mum ortalamasının en az VOL_MULT katı (15m için 3x)
+  - Hareketlilik: ATR/fiyat en az MIN_ATR_PCT (15m için %1.5) ve son 5 seansın ortalama günlük
+    hareketi (yüksek-düşük/kapanış) en az MIN_DAY_RANGE_PCT (gün içi mumlar için %5); hareketsiz hisseler elenir
+  - Kırılım mumunda en az MIN_BAR_DOLLAR_VOL kadar $ işlem (15m için 25K$)
+  - Sıralama ve üst sınır: her taramada en fazla MAX_SIGNALS (6), günde en fazla MAX_DAILY (20) sinyal
+  - Likidite filtresi: fiyat >= 0.20$, tahmini günlük işlem hacmi >= 250K$ (MIN_PRICE / MIN_DOLLAR_VOL)
+
+Zaman dilimi: varsayılan 15 DAKİKALIK mum (INTERVAL=15m). Diğerleri için INTERVAL=5m / 30m / 1h / 1d
+verilir; her biri için uygun varsayılanlar PRESETS içinde (backtest edilmedi, env ile ezilebilir).
+
+Risk / hedefler:
+  SL  = min(kırılım mumunun dibi, çizgi) - 0.25*ATR  (risk 0.8-2.5 ATR arasına sıkıştırılır)
+  TPn = Giriş + n_R * risk   (varsayılan 1R / 2R / 3R, TP_R ile değişir)
 
 Kullanım:
-    python scanner.py --once   # tek tarama (piyasa kapalıysa hemen çıkar)
-    python scanner.py --test   # Telegram'ı ve veri bağlantısını dener (piyasa kapalıyken de çalışır)
+  python scanner.py                       # tüm evreni tara, Telegram'a gönder
+  python scanner.py --dry-run             # Telegram'a göndermeden ekrana yaz
+  python scanner.py --tickers AAPL,TSLA   # sadece bu hisseleri tara
+  python scanner.py --test-telegram       # bot bağlantısını dene
+
+Ortam değişkenleri: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (+ isteğe bağlı ayarlar)
+Bu bir yatırım tavsiyesi değildir; sinyallerin geçmiş başarısı test edilmemiştir.
 """
+from __future__ import annotations
+
+import argparse
+import html
+import io
 import json
 import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+import numpy as np
+import pandas as pd
+import requests
+
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
+NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt"
+OTHER_URL = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
+BAD_NAME = re.compile(r"warrant|\brights?\b|\bunits?\b|preferred|notes? due|depositary|% ", re.I)
+GOOD_SYMBOL = re.compile(r"^[A-Z]{1,5}(-[A-Z])?$")
+INTERVAL_DELTA = {"1m": "1min", "2m": "2min", "5m": "5min", "15m": "15min", "30m": "30min", "60m": "1h", "1h": "1h"}
+BARS_PER_DAY = {"1d": 1, "1h": 6.5, "60m": 6.5, "30m": 13, "15m": 26, "5m": 78, "2m": 195, "1m": 390}
+# Zaman dilimine göre varsayılanlar. yfinance sınırları: 1m en fazla ~7 gün, 2m-30m en fazla 60 gün.
+PRESETS = {
+    "1d": dict(period="10mo", lookback=100, min_drop_pct=3.0, line_tol_pct=1.0, break_buf_pct=0.5, max_ext_pct=8.0,
+               vol_mult=2.0, min_atr_pct=3.0, min_range_atr=1.0, min_drop_atr=2.0, min_bar_dollar_vol=250_000,
+               min_day_range_pct=0.0),
+    "1h": dict(period="60d", lookback=120, min_drop_pct=2.0, line_tol_pct=0.8, break_buf_pct=0.4, max_ext_pct=6.0,
+               vol_mult=2.5, min_atr_pct=1.8, min_range_atr=1.0, min_drop_atr=2.0, min_bar_dollar_vol=75_000,
+               min_day_range_pct=5.0),
+    "30m": dict(period="30d", lookback=150, min_drop_pct=1.5, line_tol_pct=0.6, break_buf_pct=0.3, max_ext_pct=5.0,
+                vol_mult=3.0, min_atr_pct=1.3, min_range_atr=1.0, min_drop_atr=2.0, min_bar_dollar_vol=40_000,
+                min_day_range_pct=5.0),
+    "15m": dict(period="10d", lookback=150, min_drop_pct=1.0, line_tol_pct=0.5, break_buf_pct=0.3, max_ext_pct=4.0,
+                vol_mult=3.0, min_atr_pct=1.5, min_range_atr=1.0, min_drop_atr=2.0, min_bar_dollar_vol=25_000,
+                min_day_range_pct=5.0),
+    "5m": dict(period="10d", lookback=150, min_drop_pct=0.8, line_tol_pct=0.4, break_buf_pct=0.2, max_ext_pct=3.0,
+               vol_mult=3.0, min_atr_pct=0.7, min_range_atr=1.0, min_drop_atr=2.0, min_bar_dollar_vol=10_000,
+               min_day_range_pct=5.0),
+    "1m": dict(period="5d", lookback=200, min_drop_pct=0.5, line_tol_pct=0.3, break_buf_pct=0.15, max_ext_pct=2.0,
+               vol_mult=3.0, min_atr_pct=0.4, min_range_atr=1.0, min_drop_atr=2.0, min_bar_dollar_vol=3_000,
+               min_day_range_pct=5.0),
+}
 
 
-# ---------------------------------------------------------------- ayarlar
-ALPACA_KEY = os.environ.get("ALPACA_KEY", "")
-ALPACA_SECRET = os.environ.get("ALPACA_SECRET", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# --------------------------------------------------------------------------- ayarlar
+@dataclass
+class Cfg:
+    interval: str
+    period: str
+    lookback: int
+    pivot_k: int
+    min_span: int
+    max_anchor_age: int
+    min_drop_pct: float
+    min_touches: int
+    line_tol_pct: float
+    break_buf_pct: float
+    max_ext_pct: float
+    vol_mult: float
+    min_close_pos: float
+    min_price: float
+    min_dollar_vol: float
+    min_atr_pct: float
+    min_range_atr: float
+    min_drop_atr: float
+    min_bar_dollar_vol: float
+    min_day_range_pct: float
+    tp_r: tuple
+    atr_n: int
+    max_signals: int
+    max_daily: int
+    cooldown_days: int
+    batch: int
+    universe: str
+    sent_file: str
 
 
-def env_float(name, default):
-    """Boş veya hatalı değerde varsayılana döner."""
-    try:
-        return float(os.environ.get(name, "") or default)
-    except ValueError:
-        return float(default)
+def _env(name: str, default):
+    """Ortam değişkeni; tanımsız veya boşsa (GitHub'da tanımsız variable boş gelir) varsayılan."""
+    v = os.getenv(name)
+    return default if v is None or not v.strip() else v.strip()
 
 
-RVOL_MIN = env_float("RVOL_MIN", 4)          # normalin kaç katı hacim
-CHANGE_MIN = env_float("CHANGE_MIN", 5)      # önceki kapanışa göre en az % değişim
-PRICE_MIN = env_float("PRICE_MIN", 1)        # en düşük fiyat ($)
-PRICE_MAX = env_float("PRICE_MAX", 30)       # en yüksek fiyat ($)
-MIN_AVG_VOL = env_float("MIN_AVG_VOL", 2000) # 20 günlük ort. günlük hacim alt sınırı (IEX adedi)
-MIN_DAY_VOL = env_float("MIN_DAY_VOL", 5000) # bugünkü hacim alt sınırı (IEX adedi)
-PRE_VOL_FRAC = env_float("PRE_VOL_FRAC", 0.1) # seans öncesi: IEX hacmi, ortalama günlük hacmin en az bu oranı olsun
-MAX_DAY_VOL = env_float("MAX_DAY_VOL", 10000) # normal seans/seans sonrası: bugünkü IEX hacmi bundan DÜŞÜK olsun (0 = sınır yok)
-PRE_MAX_VOL = env_float("PRE_MAX_VOL", 0)     # seans öncesi: IEX hacmi bundan düşük olsun (0 = sınır yok)
-PRE_MIN_VOL = env_float("PRE_MIN_VOL", 1000)  # seans öncesi: en az bu kadar IEX hacmi (seans öncesi işlemler seyrek olduğundan düşük)
-MAX_ALERTS_PER_SCAN = 10
-
-TRADE_URL = "https://paper-api.alpaca.markets"
-DATA_URL = "https://data.alpaca.markets"
-CACHE_FILE = os.path.join(HERE, "avg_cache.json")      # günlük ortalama hacimler
-ALERTED_FILE = os.path.join(HERE, "alerted.json")      # bugün bildirilen hisseler
+def _f(name: str, default: float) -> float:
+    return float(_env(name, default))
 
 
-def log(msg):
-    print(datetime.now().strftime("%H:%M:%S"), msg, flush=True)
+def _i(name: str, default: int) -> int:
+    return int(float(_env(name, default)))
 
 
-# ---------------------------------------------------------------- http
-def http_json(url, headers=None, data=None, retries=4):
-    last = ""
-    for attempt in range(retries):
-        req = urllib.request.Request(url, data=data, headers=headers or {})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "ignore")[:300]
-            last = f"HTTP {e.code}: {body}"
-            if e.code == 429 or e.code >= 500:
-                time.sleep(5 * (attempt + 1))
-                continue
-            raise RuntimeError(last)
-        except (urllib.error.URLError, TimeoutError) as e:
-            last = str(e)
-            time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"İstek başarısız ({last}): {url[:90]}")
+def _s(name: str, default: str) -> str:
+    return str(_env(name, default))
 
 
-def alpaca_headers():
-    return {"APCA-API-KEY-ID": ALPACA_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET}
-
-
-def parse_ts(s):
-    s = s.replace("Z", "+00:00")
-    s = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), s)
-    return datetime.fromisoformat(s)
-
-
-# ---------------------------------------------------------------- telegram
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode(
-        {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": "true"}
-    ).encode()
-    http_json(url, data=data)
-
-
-# ---------------------------------------------------------------- alpaca
-def get_clock():
-    return http_json(TRADE_URL + "/v2/clock", alpaca_headers())
-
-
-def session_fraction(clock):
-    """Seansın ne kadarının geçtiği (0.1 - 1.0). Piyasa kapalıysa 1."""
-    if not clock.get("is_open"):
-        return 1.0
-    now = parse_ts(clock["timestamp"])
-    close = parse_ts(clock["next_close"])
-    left = (close - now).total_seconds() / 60
-    elapsed = 390 - left
-    return min(max(elapsed / 390, 0.1), 1.0)
-
-
-def get_symbols():
-    url = TRADE_URL + "/v2/assets?" + urllib.parse.urlencode(
-        {"status": "active", "asset_class": "us_equity"}
+def load_cfg() -> Cfg:
+    tp = tuple(float(x) for x in _s("TP_R", "1,2,3").split(",") if x.strip())
+    if len(tp) < 3:
+        tp = (1.0, 2.0, 3.0)
+    interval = _s("INTERVAL", "15m").lower()
+    p = PRESETS.get("1h" if interval == "60m" else interval, PRESETS["15m"])
+    return Cfg(
+        interval=interval,
+        period=_s("PERIOD", p["period"]),
+        lookback=_i("LOOKBACK", p["lookback"]),  # kaç mum geriye bakılsın
+        pivot_k=_i("PIVOT_K", 3),                # swing tepesi için sağ/sol mum sayısı
+        min_span=_i("MIN_SPAN", 10),             # iki tepe arası en az mum
+        max_anchor_age=_i("MAX_ANCHOR_AGE", 60), # ikinci tepe en fazla kaç mum önce
+        min_drop_pct=_f("MIN_DROP_PCT", p["min_drop_pct"]),  # iki tepe arası en az düşüş %
+        min_touches=_i("MIN_TOUCHES", 3),        # çizgiye en az bu kadar tepe dokunmuş olsun (2 nokta her zaman çizgi verir)
+        line_tol_pct=_f("LINE_TOL_PCT", p["line_tol_pct"]),    # tepelerin çizgiyi aşabileceği tolerans %
+        break_buf_pct=_f("BREAK_BUF_PCT", p["break_buf_pct"]),  # kapanış çizginin en az bu kadar üstünde
+        max_ext_pct=_f("MAX_EXT_PCT", p["max_ext_pct"]),        # çizgiden aşırı uzaklaşmışsa (kovalama) alma
+        vol_mult=_f("VOL_MULT", p["vol_mult"]),  # kırılım mumu hacmi / son 20 mum ortalaması
+        min_close_pos=_f("MIN_CLOSE_POS", 0.7),  # kapanış mum aralığının üst %30'unda olsun
+        min_price=_f("MIN_PRICE", 0.20),
+        min_dollar_vol=_f("MIN_DOLLAR_VOL", 250_000),  # tahmini günlük $ hacim; 0 yaparsan filtre kalkar
+        min_atr_pct=_f("MIN_ATR_PCT", p["min_atr_pct"]),        # ATR/fiyat bunun altındaysa hisse "hareketsiz"
+        min_range_atr=_f("MIN_RANGE_ATR", p["min_range_atr"]),  # kırılım mumu en az bu kadar ATR boyunda
+        min_drop_atr=_f("MIN_DROP_ATR", p["min_drop_atr"]),     # çizginin iki tepesi arası düşüş en az bu kadar ATR
+        min_bar_dollar_vol=_f("MIN_BAR_DOLLAR_VOL", p["min_bar_dollar_vol"]),  # kırılım mumunda en az bu kadar $ işlem
+        # son 5 seansın ortalama günlük aralığı (yüksek-düşük)/kapanış % bunun altındaysa hisse "hareketsiz"; 0 = kapalı
+        min_day_range_pct=_f("MIN_DAY_RANGE_PCT", p["min_day_range_pct"]),
+        tp_r=tp[:3],
+        atr_n=_i("ATR_N", 14),
+        max_signals=_i("MAX_SIGNALS", 6),        # her taramada en fazla kaç sinyal
+        max_daily=_i("MAX_DAILY", 20),           # bir günde toplam en fazla kaç sinyal
+        cooldown_days=_i("COOLDOWN_DAYS", 5),
+        batch=_i("BATCH", 200),
+        universe=_s("UNIVERSE", "all").lower(),  # all | nasdaq
+        sent_file=_s("SENT_FILE", "sent_signals.json"),
     )
-    assets = http_json(url, alpaca_headers())
-    syms = [
-        a["symbol"]
-        for a in assets
-        if a.get("tradable")
-        and a.get("exchange") in ("NASDAQ", "NYSE", "AMEX", "ARCA", "BATS")
-        and a["symbol"].isalpha()
-    ]
-    return sorted(syms)
 
 
-def fetch_avg_volumes(symbols, today_str):
-    """Her hisse için son 20 işlem gününün ortalama günlük hacmi (bugün hariç)."""
-    start = (datetime.now(timezone.utc) - timedelta(days=40)).strftime("%Y-%m-%d")
-    avg = {}
-    total = len(symbols)
-    for i in range(0, total, 200):
-        chunk = symbols[i:i + 200]
-        vols = {}
-        token = None
-        while True:
-            params = {
-                "symbols": ",".join(chunk),
-                "timeframe": "1Day",
-                "start": start,
-                "limit": 10000,
-                "feed": "iex",
-                "adjustment": "raw",
-            }
-            if token:
-                params["page_token"] = token
-            data = http_json(DATA_URL + "/v2/stocks/bars?" + urllib.parse.urlencode(params), alpaca_headers())
-            for sym, bars in (data.get("bars") or {}).items():
-                for b in bars:
-                    if b["t"][:10] != today_str:
-                        vols.setdefault(sym, []).append(b["v"])
-            token = data.get("next_page_token")
-            if not token:
-                break
-        for sym, v in vols.items():
-            v = v[-20:]
-            if len(v) >= 10:
-                avg[sym] = sum(v) / len(v)
-        log(f"Ortalama hacimler: {min(i + 200, total)}/{total}")
-        time.sleep(0.4)
-    return avg
+# --------------------------------------------------------------------------- evren
+def _fetch_symbol_file(url: str) -> pd.DataFrame:
+    r = requests.get(url, headers=UA, timeout=30)
+    r.raise_for_status()
+    # keep_default_na=False: "NA", "NAN" gibi gerçek hisse kodları boş değer sanılmasın
+    df = pd.read_csv(io.StringIO(r.text), sep="|", dtype=str, keep_default_na=False)
+    first = df.columns[0]
+    return df[~df[first].astype(str).str.startswith("File Creation Time")].copy()
 
 
-def load_cached_avg(today_str):
-    """Bugüne ait kayıtlı ortalama hacimler varsa döner, yoksa None."""
-    try:
-        with open(CACHE_FILE, encoding="utf-8") as f:
-            cache = json.load(f)
-        if cache.get("date") == today_str and cache.get("avg"):
-            return cache["avg"]
-    except (OSError, ValueError):
-        pass
+def _clean_symbols(df: pd.DataFrame, sym_col: str) -> list[str]:
+    df = df.copy()
+    df = df[df["Test Issue"] != "Y"]
+    df = df[df["ETF"] != "Y"]
+    df = df[~df["Security Name"].str.contains(BAD_NAME)]
+    syms = df[sym_col].astype(str).str.strip().str.upper().str.replace(".", "-", regex=False)
+    return [s for s in syms if isinstance(s, str) and GOOD_SYMBOL.match(s)]
+
+
+def load_universe(kind: str) -> list[str]:
+    syms: list[str] = []
+    nas = _fetch_symbol_file(NASDAQ_URL)
+    syms += _clean_symbols(nas, "Symbol")
+    if kind != "nasdaq":
+        oth = _fetch_symbol_file(OTHER_URL)
+        syms += _clean_symbols(oth, "ACT Symbol")
+    return sorted(set(syms))
+
+
+# --------------------------------------------------------------------------- veri
+def download_batch(tickers: list[str], cfg: Cfg) -> Optional[pd.DataFrame]:
+    import yfinance as yf  # tembel import: test ortamında gerekmez
+
+    for attempt in range(3):
+        try:
+            return yf.download(
+                tickers,
+                period=cfg.period,
+                interval=cfg.interval,
+                group_by="ticker",
+                auto_adjust=True,
+                threads=True,
+                progress=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  indirme hatası ({attempt + 1}/3): {exc}", file=sys.stderr)
+            time.sleep(3 * (attempt + 1))
     return None
 
 
-def get_avg_volumes(today_str):
-    avg = load_cached_avg(today_str)
-    if avg is not None:
-        return avg
-    log("Ortalama hacimler hesaplanıyor (günde bir kez)...")
-    avg = fetch_avg_volumes(get_symbols(), today_str)
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"date": today_str, "avg": avg}, f)
-    return avg
+def split_frames(raw: Optional[pd.DataFrame], tickers: list[str]) -> dict[str, pd.DataFrame]:
+    out: dict[str, pd.DataFrame] = {}
+    if raw is None or raw.empty:
+        return out
+    cols = ["High", "Low", "Close", "Volume"]
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" in raw.columns.get_level_values(0):  # alan adı üstte ise çevir
+            raw = raw.swaplevel(axis=1)
+        top = set(raw.columns.get_level_values(0))
+        for t in tickers:
+            if t in top:
+                sub = raw[t]
+                if all(c in sub.columns for c in cols):
+                    out[t] = sub[cols]
+    elif all(c in raw.columns for c in cols) and len(tickers) == 1:
+        out[tickers[0]] = raw[cols]
+    return out
 
 
-def load_alerted(today_str):
-    try:
-        with open(ALERTED_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if data.get("date") == today_str:
-            return set(data.get("syms", []))
-    except (OSError, ValueError):
-        pass
-    return set()
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    df = df[["High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
+    return df.dropna()
 
 
-def save_alerted(today_str, syms):
-    with open(ALERTED_FILE, "w", encoding="utf-8") as f:
-        json.dump({"date": today_str, "syms": sorted(syms)}, f)
+def drop_incomplete(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """Henüz kapanmamış son mumu at (kırılım sadece kapanmış mumda sayılır)."""
+    if df.empty:
+        return df
+    now_utc = pd.Timestamp.now(tz="UTC")
+    ts = pd.Timestamp(df.index[-1])
+    if interval == "1d":
+        now_ny = now_utc.tz_convert(ZoneInfo("America/New_York"))
+        if ts.date() == now_ny.date() and (now_ny.hour, now_ny.minute) < (16, 5):
+            return df.iloc[:-1]
+        return df
+    dur = pd.Timedelta(INTERVAL_DELTA.get(interval, "1h"))
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("America/New_York")
+    if ts + dur > now_utc:
+        return df.iloc[:-1]
+    return df
 
 
-# ---------------------------------------------------------------- tarama
-def scan_once(symbols, avg, frac, today_str, require_today=True):
-    """Döner: (alarmlar, adaylar). Adaylar hacim tabanını geçenlerin tamamı, alarmlar eşikleri de geçenler."""
-    candidates = []
-    pool = [s for s in symbols if s in avg and avg[s] >= MIN_AVG_VOL]
-    for i in range(0, len(pool), 500):
-        chunk = pool[i:i + 500]
-        url = DATA_URL + "/v2/stocks/snapshots?" + urllib.parse.urlencode(
-            {"symbols": ",".join(chunk), "feed": "iex"}
-        )
-        data = http_json(url, alpaca_headers())
-        snaps = data.get("snapshots", data)
-        for sym, snap in snaps.items():
-            db = snap.get("dailyBar")
-            pb = snap.get("prevDailyBar")
-            if not db or not pb or not pb.get("c"):
+def avg_day_range_pct(df: pd.DataFrame, interval: str, n: int = 5, min_days: int = 3) -> float:
+    """Önceki (tamamlanmış) n seansın ortalama günlük aralığı: (en yüksek - en düşük) / kapanış * 100.
+    Bugünkü (son mumun olduğu) seans hariç tutulur. Yeterli seans yoksa nan döner."""
+    if df.empty:
+        return float("nan")
+    if interval == "1d":
+        g = df.iloc[:-1].tail(n)
+        rp = (g["High"] - g["Low"]) / g["Close"] * 100
+    else:
+        dates = pd.DatetimeIndex(df.index).date
+        daily = df.groupby(dates).agg(H=("High", "max"), L=("Low", "min"), C=("Close", "last"))
+        rp = ((daily["H"] - daily["L"]) / daily["C"] * 100).iloc[:-1].tail(n)
+    return float(rp.mean()) if len(rp) >= min_days else float("nan")
+
+
+def prefilter(df: pd.DataFrame, cfg: Cfg) -> bool:
+    if len(df) < max(60, cfg.atr_n + 30):
+        return False
+    if df["Close"].iloc[-1] < cfg.min_price:
+        return False
+    per_bar = (df["Close"] * df["Volume"]).iloc[-20:].mean()
+    daily_est = per_bar * BARS_PER_DAY.get(cfg.interval, 1)  # mum başına $ hacmi -> günlük tahmin
+    if daily_est < cfg.min_dollar_vol:
+        return False
+    if cfg.min_day_range_pct > 0:  # hareketsiz hisseleri ele (geçmiş günlük hareketi yetersiz veya bilinmiyor)
+        dr = avg_day_range_pct(df, cfg.interval)
+        if not (dr >= cfg.min_day_range_pct):
+            return False
+    return True
+
+
+# --------------------------------------------------------------------------- tespit
+def find_pivot_highs(high: np.ndarray, k: int) -> list[int]:
+    """Solundaki k ve sağındaki k mumdan yüksek olan swing tepeleri."""
+    piv = []
+    for i in range(k, len(high) - k):
+        if high[i] > high[i - k:i].max() and high[i] >= high[i + 1:i + k + 1].max():
+            piv.append(i)
+    return piv
+
+
+def detect_breakout(df: pd.DataFrame, cfg: Cfg) -> Optional[dict]:
+    d = df.iloc[-cfg.lookback:]
+    n = len(d)
+    if n < max(40, cfg.atr_n + 25):
+        return None
+    hi = d["High"].to_numpy(float)
+    lo = d["Low"].to_numpy(float)
+    cl = d["Close"].to_numpy(float)
+    vol = d["Volume"].to_numpy(float)
+    last = n - 1
+    tol = cfg.line_tol_pct / 100
+    buf = cfg.break_buf_pct / 100
+    ext = cfg.max_ext_pct / 100
+
+    # ATR (kırılım mumu hariç son atr_n mum): hareketlilik filtreleri için önce hesaplanır
+    prev_c = cl[:-1]
+    tr = np.maximum.reduce([hi[1:] - lo[1:], np.abs(hi[1:] - prev_c), np.abs(lo[1:] - prev_c)])
+    atr = float(tr[-(cfg.atr_n + 1):-1].mean())
+    if not np.isfinite(atr) or atr <= 0:
+        return None
+    if atr / cl[last] * 100 < cfg.min_atr_pct:          # hareketsiz hisse
+        return None
+    if cl[last] * vol[last] < cfg.min_bar_dollar_vol:   # kırılım mumunda gerçek para girişi yok
+        return None
+
+    pivs = find_pivot_highs(hi, cfg.pivot_k)[-8:]
+    best = None
+    for a in range(len(pivs)):
+        for b in range(a + 1, len(pivs)):
+            i, j = pivs[a], pivs[b]
+            if j - i < cfg.min_span or last - j > cfg.max_anchor_age:
                 continue
-            if require_today and db["t"][:10] != today_str:
+            if hi[j] >= hi[i] or (hi[i] - hi[j]) / hi[i] * 100 < cfg.min_drop_pct:
                 continue
-            vol = db["v"]
-            if vol < MIN_DAY_VOL:
+            if hi[i] - hi[j] < cfg.min_drop_atr * atr:   # düşüş normal gürültüden büyük olmalı
                 continue
-            price = (snap.get("latestTrade") or {}).get("p") or db["c"]
-            change = (price / pb["c"] - 1) * 100
-            rvol = vol / (avg[sym] * frac)
-            candidates.append({"sym": sym, "price": price, "change": change, "rvol": rvol, "vol": vol})
+            slope = (hi[j] - hi[i]) / (j - i)
+            line = hi[i] + slope * (np.arange(i, last + 1) - i)  # i..last
+            if line[-1] <= 0:
+                continue
+            seg_line = line[:-1]
+            if np.any(hi[i:last] > seg_line * (1 + tol)):       # arada çizgiyi aşan tepe var
+                continue
+            if cl[last - 1] > line[-2]:                          # kırılım taze değil
+                continue
+            lvl = line[-1]
+            if cl[last] <= lvl * (1 + buf) or cl[last] > lvl * (1 + ext):
+                continue
+            touches = sum(
+                1 for p in pivs
+                if i <= p < last and abs(hi[p] - line[p - i]) <= line[p - i] * tol
+            )
+            if touches < cfg.min_touches:
+                continue
+            key = (touches, j - i)
+            if best is None or key > best[0]:
+                best = (key, i, j, lvl, touches)
+    if best is None:
+        return None
+    _, i, j, lvl, touches = best
 
-    alerts = [
-        c for c in candidates
-        if c["rvol"] >= RVOL_MIN
-        and c["change"] >= CHANGE_MIN
-        and PRICE_MIN <= c["price"] <= PRICE_MAX
-        and (not MAX_DAY_VOL or c["vol"] < MAX_DAY_VOL)
+    base_vol = vol[last - 20:last].mean()
+    vol_ratio = vol[last] / base_vol if base_vol > 0 else 0.0
+    if vol_ratio < cfg.vol_mult:
+        return None
+    rng = hi[last] - lo[last]
+    close_pos = (cl[last] - lo[last]) / rng if rng > 0 else 1.0
+    if close_pos < cfg.min_close_pos:
+        return None
+    if rng < cfg.min_range_atr * atr:                    # kırılım mumu "genişleme" mumu olmalı
+        return None
+
+    entry = float(cl[last])
+    risk = entry - (min(lo[last], lvl) - 0.25 * atr)
+    risk = min(max(risk, 0.8 * atr), 2.5 * atr)
+    sl = entry - risk
+    if sl <= 0:
+        return None
+    tps = [entry + r * risk for r in cfg.tp_r]
+    return {
+        "entry": entry,
+        "sl": float(sl),
+        "tps": [float(x) for x in tps],
+        "line_level": float(lvl),
+        "touches": int(touches),
+        "span_bars": int(last - i),
+        "anchor1": str(pd.Timestamp(d.index[i]).date()),
+        "anchor2": str(pd.Timestamp(d.index[j]).date()),
+        "vol_ratio": float(vol_ratio),
+        "atr_pct": float(atr / entry * 100),
+        # sıralama: hacim patlaması x çizgi kalitesi x hareketlilik (az sinyal gönderirken en iyiler öne geçsin)
+        "score": float(vol_ratio * min(touches, 4) * (atr / entry * 100) ** 0.5),
+    }
+
+
+# --------------------------------------------------------------------------- mesaj
+def fmt_price(p: float) -> str:
+    return f"{p:,.2f}" if p >= 1 else f"{p:.4f}"
+
+
+def pct(a: float, b: float) -> float:
+    return (a / b - 1) * 100
+
+
+def build_message(s: dict, cfg: Cfg) -> str:
+    sym = html.escape(s["symbol"])
+    tf = "günlük" if cfg.interval == "1d" else cfg.interval
+    e = s["entry"]
+    lines = [
+        f"🟢 <b>{sym}</b> — düşen trend kırılımı ({tf})",
+        f"Giriş: <b>{fmt_price(e)}</b>",
+        f"🛑 SL: {fmt_price(s['sl'])} ({pct(s['sl'], e):+.1f}%)",
     ]
-    alerts.sort(key=lambda c: c["rvol"], reverse=True)
-    candidates.sort(key=lambda c: c["rvol"], reverse=True)
-    return alerts, candidates
-
-
-def format_alert(c):
-    return (
-        f"🚀 {c['sym']}  ${c['price']:.2f}  ({c['change']:+.1f}%)" + ("  [seans sonrası]" if c.get("post") else "") + "\n"
-        f"Göreceli hacim: {c['rvol']:.1f}x\n"
-        f"Bugünkü hacim (IEX): {int(c['vol']):,}\n"
-        f"https://finviz.com/quote.ashx?t={c['sym']}"
+    for k, (tp, r) in enumerate(zip(s["tps"], cfg.tp_r), 1):
+        lines.append(f"🎯 TP{k}: {fmt_price(tp)} ({pct(tp, e):+.1f}%) · {r:g}R")
+    lines.append(
+        f"📐 {s['touches']} dokunuşlu çizgi · {s['span_bars']} mum · "
+        f"kırılan seviye {fmt_price(s['line_level'])}"
     )
+    stats = f"📊 Hacim {s['vol_ratio']:.1f}x ort. · ATR %{s['atr_pct']:.1f}"
+    dr = s.get("day_range_pct")
+    if dr is not None and dr == dr:  # nan değilse
+        stats += f" · günlük ort. hareket %{dr:.0f}"
+    lines.append(stats)
+    tv = html.escape(s["symbol"].replace("-", "."))
+    lines.append(f'<a href="https://www.tradingview.com/symbols/{tv}/">Grafik</a>')
+    return "\n".join(lines)
 
 
-# ---------------------------------------------------------------- seans öncesi tarama
-def fetch_pre_volumes(syms, today_str):
-    """Bugün New York 04:00'dan şimdiye kadar olan IEX hacmi: {sembol: hacim}."""
-    y, m, d = map(int, today_str.split("-"))
-    start = (datetime(y, m, d, 4, 0, tzinfo=ZoneInfo("America/New_York"))
-             .astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-    vols = {}
-    for i in range(0, len(syms), 100):
-        token = None
-        while True:
-            params = {"symbols": ",".join(syms[i:i + 100]), "timeframe": "5Min", "start": start,
-                      "limit": 10000, "feed": "iex", "adjustment": "raw"}
-            if token:
-                params["page_token"] = token
-            data = http_json(DATA_URL + "/v2/stocks/bars?" + urllib.parse.urlencode(params), alpaca_headers())
-            for sym, bars in (data.get("bars") or {}).items():
-                vols[sym] = vols.get(sym, 0) + sum(b["v"] for b in bars)
-            token = data.get("next_page_token")
-            time.sleep(0.3)
-            if not token:
-                break
-    return vols
+def tg_send(token: str, chat_id: str, text: str) -> bool:
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        if not r.ok:
+            print(f"Telegram hatası {r.status_code}: {r.text[:200]}", file=sys.stderr)
+        return r.ok
+    except requests.RequestException as exc:
+        print(f"Telegram bağlantı hatası: {exc}", file=sys.stderr)
+        return False
 
 
-def scan_premarket(avg, today_str):
-    """Seans öncesi: fiyat önceki kapanışa göre yükselmiş ve seans öncesi hacim ortalama günlük hacme göre yüksek mi."""
-    pool = [s for s in avg if avg[s] >= MIN_AVG_VOL]
-    cands = []
-    for i in range(0, len(pool), 500):
-        chunk = pool[i:i + 500]
-        url = DATA_URL + "/v2/stocks/snapshots?" + urllib.parse.urlencode({"symbols": ",".join(chunk), "feed": "iex"})
-        data = http_json(url, alpaca_headers())
-        snaps = data.get("snapshots", data)
-        for sym, snap in snaps.items():
-            price = (snap.get("latestTrade") or {}).get("p")
-            db, pb = snap.get("dailyBar"), snap.get("prevDailyBar")
-            if not price:
+# --------------------------------------------------------------------------- tekrar önleme
+def load_state(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path: str, state: dict) -> None:
+    cutoff = date.today().toordinal() - 30
+    state = {
+        k: v for k, v in state.items()
+        if date.fromisoformat(v.get("sent", "1970-01-01")).toordinal() >= cutoff
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+
+
+def pick_to_send(signals: list[dict], state: dict, cfg: Cfg, today: Optional[date] = None) -> list[dict]:
+    """Yeni sinyallerden, tarama başı ve günlük üst sınırı aşmayacak kadarını (en yüksek skorlular) seç."""
+    today = today or datetime.now(timezone.utc).date()
+    sent_today = sum(1 for v in state.values() if v.get("sent") == today.isoformat())
+    room = max(0, min(cfg.max_signals, cfg.max_daily - sent_today))
+    return filter_new(signals, state, cfg, today)[:room]
+
+
+def filter_new(signals: list[dict], state: dict, cfg: Cfg, today: Optional[date] = None) -> list[dict]:
+    today = today or datetime.now(timezone.utc).date()
+    out = []
+    for s in signals:
+        prev = state.get(s["symbol"])
+        if prev:
+            if prev.get("bar") == s["bar_date"]:
                 continue
-            if db and db["t"][:10] == today_str:      # bugünün günlük mumu varsa önceki kapanış prevDailyBar'dır
-                prev = (pb or {}).get("c")
-            else:                                       # yoksa son günlük mum dünün kapanışıdır
-                prev = (db or {}).get("c")
-            if not prev:
+            try:
+                age = (today - date.fromisoformat(prev["sent"])).days
+            except (KeyError, ValueError):
+                age = 999
+            if age < cfg.cooldown_days:
                 continue
-            change = (price / prev - 1) * 100
-            if change >= CHANGE_MIN and PRICE_MIN <= price <= PRICE_MAX:
-                cands.append((change, sym, price))
-    cands.sort(reverse=True)
-    cands = cands[:200]
-    vols = fetch_pre_volumes([s for _, s, _ in cands], today_str) if cands else {}
-    alerts = []
-    for change, sym, price in cands:
-        vol = vols.get(sym, 0)
-        if vol >= PRE_MIN_VOL and vol >= PRE_VOL_FRAC * avg[sym] and (not PRE_MAX_VOL or vol < PRE_MAX_VOL):
-            alerts.append({"sym": sym, "price": price, "change": change, "vol": vol,
-                           "pct_avg": vol / avg[sym] * 100, "pre": True})
-    alerts.sort(key=lambda c: c["pct_avg"], reverse=True)
-    return alerts
+        out.append(s)
+    return out
 
 
-def format_alert_pre(c):
-    return (
-        f"🌅 {c['sym']}  ${c['price']:.2f}  ({c['change']:+.1f}%)  [seans öncesi]\n"
-        f"Seans öncesi hacim (IEX): {int(c['vol']):,}, normal günlük hacmin %{c['pct_avg']:.0f}'i\n"
-        f"https://finviz.com/quote.ashx?t={c['sym']}"
+# --------------------------------------------------------------------------- ana akış
+def scan(tickers: list[str], cfg: Cfg) -> tuple[list[dict], int]:
+    signals: list[dict] = []
+    scanned = 0
+    total = len(tickers)
+    for start in range(0, total, cfg.batch):
+        batch = tickers[start:start + cfg.batch]
+        frames = split_frames(download_batch(batch, cfg), batch)
+        for t, raw_df in frames.items():
+            df = drop_incomplete(clean(raw_df), cfg.interval)
+            if not prefilter(df, cfg):
+                continue
+            scanned += 1
+            sig = detect_breakout(df, cfg)
+            if sig:
+                sig["symbol"] = t
+                sig["bar_date"] = str(df.index[-1])
+                sig["day_range_pct"] = avg_day_range_pct(df, cfg.interval)
+                signals.append(sig)
+        print(f"  {min(start + cfg.batch, total)}/{total} hisse işlendi, {len(signals)} sinyal", flush=True)
+        time.sleep(1)
+    signals.sort(key=lambda s: s["score"], reverse=True)
+    return signals, scanned
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tickers", help="Virgülle ayrılmış liste (örn. AAPL,TSLA). Boşsa tüm evren.")
+    ap.add_argument("--dry-run", action="store_true", help="Telegram'a gönderme, ekrana yaz.")
+    ap.add_argument("--test-telegram", action="store_true", help="Sadece bir test mesajı gönder.")
+    args = ap.parse_args()
+
+    cfg = load_cfg()
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    can_send = bool(token and chat_id) and not args.dry_run
+
+    if args.test_telegram:
+        if not (token and chat_id):
+            print("TELEGRAM_BOT_TOKEN ve TELEGRAM_CHAT_ID tanımlı değil.", file=sys.stderr)
+            return 1
+        ok = tg_send(token, chat_id, "✅ Düşen trend kırılım tarayıcısı bağlantı testi")
+        return 0 if ok else 1
+
+    if args.tickers or os.getenv("TICKERS"):
+        raw = args.tickers or os.getenv("TICKERS", "")
+        tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
+    else:
+        print("Hisse evreni indiriliyor...", flush=True)
+        try:
+            tickers = load_universe(cfg.universe)
+        except requests.RequestException as exc:
+            print(f"Evren indirilemedi: {exc}. --tickers ile liste verebilirsin.", file=sys.stderr)
+            return 1
+    print(f"{len(tickers)} sembol taranacak ({cfg.interval} mumlar).", flush=True)
+
+    signals, scanned = scan(tickers, cfg)
+    state = load_state(cfg.sent_file)
+    fresh = pick_to_send(signals, state, cfg)
+    print(f"Taranan: {scanned} | kırılım: {len(signals)} | gönderilecek sinyal: {len(fresh)}")
+
+    if not fresh:
+        if can_send and os.getenv("SEND_EMPTY", "0") == "1":
+            tg_send(token, chat_id, f"📡 Tarama bitti ({scanned} hisse): yeni düşen trend kırılımı yok.")
+        return 0
+
+    header = (
+        f"📡 <b>Düşen trend kırılımı taraması</b> — {datetime.now(timezone.utc):%Y-%m-%d}\n"
+        f"{len(fresh)} yeni sinyal ({scanned} hisse tarandı). Yatırım tavsiyesi değildir."
     )
+    if cfg.interval == "1d":  # 15 dakikalıkta her taramada başlık mesajı gürültü olur, sadece günlükte gönder
+        if can_send:
+            tg_send(token, chat_id, header)
+        else:
+            print("\n" + re.sub(r"<[^>]+>", "", header))
 
+    today = datetime.now(timezone.utc).date().isoformat()
+    for s in fresh:
+        msg = build_message(s, cfg)
+        if can_send:
+            if tg_send(token, chat_id, msg):
+                state[s["symbol"]] = {"bar": s["bar_date"], "sent": today}
+            time.sleep(1)
+        else:
+            print("\n" + re.sub(r"<[^>]+>", "", msg))
 
-# ---------------------------------------------------------------- ana akış
-def need(name, value):
-    if not value:
-        sys.exit(f"Eksik ayar: {name}. GitHub Secrets bölümünü kontrol et.")
-
-
-def check_settings():
-    need("ALPACA_KEY", ALPACA_KEY)
-    need("ALPACA_SECRET", ALPACA_SECRET)
-    need("TELEGRAM_TOKEN", TELEGRAM_TOKEN)
-    need("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
-
-
-def run_test():
-    check_settings()
-    send_telegram("✅ Bot çalışıyor. Test taraması başlıyor...")
-    log("Telegram mesajı gönderildi.")
-
-    clock = get_clock()
-    today_str = clock["timestamp"][:10]
-    avg = get_avg_volumes(today_str)
-    log(f"{len(avg)} hissenin ortalama hacmi hazır.")
-
-    # Piyasa kapalı olabilir: son seansın verisiyle, seans oranı 1 alınır.
-    alerts, cands = scan_once(list(avg), avg, 1.0, today_str, require_today=False)
-    log(f"Eşikleri geçen: {len(alerts)}")
-    log("Hacim oranına göre ilk 5 aday (bildirim gönderilmez):")
-    for c in cands[:5]:
-        log(f"  {c['sym']:6s} ${c['price']:.2f} {c['change']:+.1f}%  {c['rvol']:.1f}x")
-    send_telegram(f"✅ Test tamam. {len(avg)} hisse tarandı, eşikleri geçen: {len(alerts)}.")
-
-
-def run_once():
-    check_settings()
-    clock = get_clock()
-    now = parse_ts(clock["timestamp"])
-    premarket = post = False
-    if clock.get("is_open"):
-        pass
-    elif parse_ts(clock["next_open"]).date() == now.date() and now.hour >= 8:
-        premarket = True      # piyasa bugün açılacak ve New York 08:00 geçti (IEX verisi 08:00'de başlar)
-    elif 16 <= now.hour < 17:
-        post = True           # seans sonrası: IEX 17:00 NY'ye kadar işlem gösterir
-    else:
-        log("Piyasa kapalı, çıkılıyor.")
-        return
-
-    today_str = clock["timestamp"][:10]
-    avg = get_avg_volumes(today_str)
-    alerted = load_alerted(today_str)
-
-    if premarket:
-        alerts = scan_premarket(avg, today_str)
-    else:
-        alerts, _ = scan_once(list(avg), avg, 1.0 if post else session_fraction(clock), today_str)
-        if post:
-            for c in alerts:
-                c["post"] = True
-    new = [c for c in alerts if c["sym"] not in alerted][:MAX_ALERTS_PER_SCAN]
-    for c in new:
-        send_telegram(format_alert_pre(c) if c.get("pre") else format_alert(c))
-        alerted.add(c["sym"])
-        log(f"ALARM{' (seans öncesi)' if c.get('pre') else ''}: {c['sym']} {c['change']:+.1f}%")
-    if not new:
-        log("Yeni alarm yok.")
-    save_alerted(today_str, alerted)
-
-
-def main():
-    args = set(sys.argv[1:])
-    if "--test" in args:
-        run_test()
-    else:
-        run_once()
+    if can_send:
+        save_state(cfg.sent_file, state)
+    elif not args.dry_run:
+        print("\n(TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID tanımlı olmadığı için mesajlar ekrana yazıldı.)")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
