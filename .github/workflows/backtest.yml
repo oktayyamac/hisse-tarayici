@@ -1,0 +1,67 @@
+# Bu dosya repoda şu yolda durmalı: .github/workflows/backtest.yml
+# Sadece elle çalışır (Actions > Backtest > Run workflow). Sonucu Telegram'a gönderir.
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample:
+        description: "Kaç hisse test edilsin (0 = tüm evren, uzun sürer)"
+        default: "2000"
+      days:
+        description: "Kaç gün geriye (15 dk için en fazla 59)"
+        default: "55"
+      cost_pct:
+        description: "Tur başına maliyet % (spread + kayma)"
+        default: "0.3"
+
+# Tarama botunu bloklamasın diye ayrı grup
+concurrency:
+  group: backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Backtest çalıştır
+        run: python backtest.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          INTERVAL: "15m"
+          SAMPLE: ${{ github.event.inputs.sample }}
+          DAYS: ${{ github.event.inputs.days }}
+          COST_PCT: ${{ github.event.inputs.cost_pct }}
+          # Botun şu anki ayarlarıyla aynı olsun diye tarama değişkenleri de okunur
+          VOL_MULT: ${{ vars.VOL_MULT }}
+          MIN_ATR_PCT: ${{ vars.MIN_ATR_PCT }}
+          MIN_DAY_RANGE_PCT: ${{ vars.MIN_DAY_RANGE_PCT }}
+          MIN_TOUCHES: ${{ vars.MIN_TOUCHES }}
+          MAX_SIGNALS: ${{ vars.MAX_SIGNALS }}
+          MAX_DAILY: ${{ vars.MAX_DAILY }}
+          MIN_PRICE: ${{ vars.MIN_PRICE }}
+          MIN_DOLLAR_VOL: ${{ vars.MIN_DOLLAR_VOL }}
+          MIN_BAR_DOLLAR_VOL: ${{ vars.MIN_BAR_DOLLAR_VOL }}
+          UNIVERSE: ${{ vars.UNIVERSE }}
+
+      - name: Sonuç dosyalarını sakla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-sonuc
+          path: |
+            backtest_report.txt
+            backtest_signals.csv
+          if-no-files-found: ignore
+ğ
